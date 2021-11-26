@@ -1,6 +1,7 @@
 nextflow.enable.dsl=2
 
 params.input = ""
+params.rfile = ""
 process smoove {
   publishDir "PipeRes", mode: 'copy'
 	input:
@@ -59,16 +60,17 @@ process expansion_hunter {
         path(catalog)
 
     output:
-        tuple(file("${sample_name}_str.vcf.gz"), val(sample_name))
+        tuple(file("${sample_name}_str.vcf"), val(sample_name))
 
 script:
-    output_file = "${sample_name}_str.vcf.gz"
+    output_file = "${sample_name}_str.vcf"
+    Expansion_Dir="/home/moabd/projects/def-wyeth/moabd/ExpansionHunter-v5.0.0-linux_x86_64/bin"
     """
-    ExpansionHunter \
+    ${Expansion_Dir}/ExpansionHunter \
     --output-prefix ${sample_name} --reference $fasta  \
     --reads ${bam} \
-    --variant-catalog ${catalog} -n ${task_cpus} -m streaming
-    mv ${sample_name}.vcf ${sample_name}_str.vcf
+    --variant-catalog ${catalog} -n ${task.cpus} 
+    mv ${sample_name}.vcf ${output_file}
     """
 
 }
@@ -78,29 +80,35 @@ process melt {
 // add gene annotation file as a parameter
  publishDir "PipeRes", mode: 'copy'
       shell = ['/bin/bash', '-euo', 'pipefail']
-      module = "java/1.8.0_192:bowtie2:bcftools"   
+      module = "java/1.8.0_192:bowtie2:bcftools:tabix"   
       input:
             tuple(val(sample_name), path(bam), path(index))
             path(fasta)
             path(fai)
-            path(tfile)i
+            path(tfile)
             path(annotation_file)
       output:
             tuple(file("${sample_name}_mei.vcf.gz"),file("${sample_name}_mei.vcf.gz.tbi"), val(sample_name))
       script:
         MELT_DIR="/home/moabd/projects/def-wyeth/moabd/MELTv2.2.2"
-        output_file="${sample_name}_mei.vcf"
+        output_file="${sample_name}_mei.vcf.gz"
          """
             mkdir -p  ${sample_name}
-            java -Xmx6g -jar ${MELT_DIR}/MELT.jar Single \
+            java -Xmx8G -jar ${MELT_DIR}/MELT.jar Single \
             -b hs37d5 \
             -t ${tfile}  \
             -h $fasta \
             -bamfile $bam \
             -w ${sample_name} \
             -n ${annotation_file}
-            bcftools concat -a -Oz v -o ${output_file} ${sample_name}/*vcf
-            bcftools index -f --tbi ${output_file}
+            # fix issues with  MELT vcfs
+            for name in {ALU,SVA,LINE1};do bcftools annotate -x FMT/GL ${sample_name}/\${name}.final_comp.vcf > \${name}.vcf;done
+            for name in {ALU,SVA,LINE1};do bcftools view -O u -o \${name}.bcf \${name}.vcf;done
+            for name in {ALU,SVA,LINE1};do bcftools sort  -m 2G -O z -o \${name}.vcf.gz \${name}.bcf;done
+            for name in {ALU,SVA,LINE1};do bcftools index --tbi \${name}.vcf.gz;done
+            bcftools concat -a -Oz  -o ${output_file} *vcf.gz
+            bcftools index --tbi ${output_file}
+
        """
 
 }
@@ -145,7 +153,7 @@ process jasmine {
     if(sample_vcfs.size() > 1) {
         """
         # jasmine can't do gzip.
-        jasmine  -Xmx6g --dup_to_ins  --threads ${task.cpus} --allow_intrasample --file_list=${workDir}/vcfs.list out_file=${output_file}  genome_file=$fasta
+        jasmine  -Xmx6g --dup_to_ins  --threads ${task.cpus} --output_genotypes --allow_intrasample --file_list=${workDir}/vcfs.list out_file=${output_file}  genome_file=$fasta
         # NOTE: removing BNDs and setting min start to > 150 as paragraph fails if start < readlength
         tiwih setsvalt --drop-bnds --inv-2-ins -o ${output_file}.tmp.vcf.gz $fasta $output_file
         bcftools sort --temp-dir /scratch/tmp/jasmine  -m 2G -O z -o ${output_file} ${output_file}.tmp.vcf.gz
@@ -179,25 +187,25 @@ process paragraph_duphold {
   output_file = "${sample}.paragraph.vcf.gz"
 
   """
-dp=\$(tiwih meandepth $bam)
-tsample=\$(tiwih samplename $bam)
-echo "id\tpath\tdepth\tread length" > sample.manifest
-echo "\$tsample\t$bam\t\$dp\t150" >> sample.manifest
-M=\$((dp * 5))
-cat sample.manifest
+    dp=\$(tiwih meandepth $bam)
+    tsample=\$(tiwih samplename $bam)
+    echo "id\tpath\tdepth\tread length" > sample.manifest
+    echo "\$tsample\t$bam\t\$dp\t150" >> sample.manifest
+    M=\$((dp * 5))
+    cat sample.manifest
+    
+    # this is the main paragraph entrypoint
+    multigrmpy.py -i $site_vcf \
+        -m sample.manifest \
+        -r $fasta \
+        -o t \
+        -t ${task.cpus} \
+        -M \$M
 
-# this is the main paragraph entrypoint
-multigrmpy.py -i $site_vcf \
-    -m sample.manifest \
-    -r $fasta \
-    -o t \
-    -t ${task.cpus} \
-    -M \$M
 
-
-# duphold adds depth annotations looking at coverage fold-change around Svs
-duphold -d -v t/genotypes.vcf.gz -b $bam -f $fasta -t 4 -o $output_file
-bcftools index --threads 3 $output_file
+    # duphold adds depth annotations looking at coverage fold-change around Svs
+    duphold -d -v t/genotypes.vcf.gz -b $bam -f $fasta -t 4 -o $output_file
+    bcftools index --threads 3 $output_file
   """
 
 }
@@ -250,6 +258,7 @@ Optional Arguments:
 //     }
 
 workflow {
+    //  Input Data //
 
     input = Channel.fromPath(params.input, checkIfExists: true)
             .splitCsv(header:true)
@@ -259,12 +268,19 @@ workflow {
     tfile = file(params.tfile)
     rfile = file(params.rfile)
     rindex = file(params.rfile + ".tbi")
+    annotation_file = file(params.annotation_file)
+    catalog = file(params.catalog)
+    
+    // Actual Workflow //
+
     sm = smoove(input, fasta, fai).view()
     mr = manta(input, fasta, fai,rfile,rindex).view()
-    // dg = dysgu(input, fasta, fai,rfile).view()
-    //melt(input, fasta, fai,tfile)
+    melt(input, fasta, fai,tfile, annotation_file)
+    expansion_hunter(input, fasta, fai, catalog)
     sv_groups = mr.concat(sm) | groupTuple(by: 2)
+    sv_groups.view()
     svs = concat_by_sample(sv_groups) | collect
+    svs.view()
     sv_merged = jasmine(svs, fasta, fasta + ".fai")
     genotyped = paragraph_duphold(sv_merged, input, fasta, fasta + ".fai")
 }
